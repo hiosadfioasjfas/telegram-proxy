@@ -123,6 +123,14 @@ async function translateAll(messages, targetLang) {
 }
 
 app.get('/fetch', async (req, res) => {
+    // This endpoint reflects a live, frequently-updating feed -- explicitly
+    // disable caching so no intermediate layer (Render's edge, a browser,
+    // a proxy in between) ever serves a stale snapshot instead of hitting
+    // Telegram fresh on every request.
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate')
+    res.set('Pragma', 'no-cache')
+    res.set('Expires', '0')
+
     try {
         const url = req.query.url
         if (!url || !url.startsWith('https://t.me/')) return res.status(403).send('Forbidden')
