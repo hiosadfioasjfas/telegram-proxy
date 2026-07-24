@@ -24,6 +24,23 @@ function parseMessages(html) {
     return messages
 }
 
+// Formats a Date in Ukraine's local time (Europe/Kyiv), handling the
+// EET (UTC+2) / EEST (UTC+3) daylight-saving switch automatically via ICU,
+// instead of a hardcoded UTC offset.
+function formatKyivTime(date) {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Europe/Kyiv',
+        day: '2-digit',
+        month: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false
+    }).formatToParts(date)
+
+    const get = (type) => parts.find(p => p.type === type)?.value || '00'
+    return `${get('day')}/${get('month')} ${get('hour')}:${get('minute')} KYIV`
+}
+
 // Google Translate's public "gtx" client endpoint (same one used by browser
 // extensions / gtranslate). Free, no API key, and noticeably better quality
 // than MyMemory / LibreTranslate for this kind of text.
@@ -94,11 +111,7 @@ app.get('/fetch', async (req, res) => {
         let tm
         while ((tm = timeRegex.exec(html)) !== null) {
             const date = new Date(tm[1])
-            const hh = String(date.getUTCHours()).padStart(2, '0')
-            const mm = String(date.getUTCMinutes()).padStart(2, '0')
-            const dd = String(date.getUTCDate()).padStart(2, '0')
-            const mo = String(date.getUTCMonth() + 1).padStart(2, '0')
-            times.push(`${dd}/${mo} ${hh}:${mm} UTC`)
+            times.push(formatKyivTime(date))
         }
 
         if (lg) {
