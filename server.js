@@ -9,6 +9,40 @@ const app = express()
 // which silently desyncs (wrong time attached to wrong message) whenever any
 // message contributes zero or more than one <time> tag (forwards, service
 // messages, grouped/album posts, reaction-only re-renders, etc.).
+// Given html and the index right after an opening <div ...> tag's '>',
+// returns the inner content up to (and the index just past) that div's
+// matching closing </div>, correctly accounting for nested <div> tags.
+// A plain non-greedy regex ([\s\S]*?)<\/div> instead stops at the FIRST
+// </div>, silently truncating whenever the div contains nested divs
+// (e.g. embedded link-preview blocks, quote blocks) -- which chopped
+// explosion-warning message text off before the warning line could be
+// matched.
+function extractDivContent(html, contentStart) {
+    let depth = 1
+    let i = contentStart
+    const openRegex = /<div\b/gi
+    const closeTag = '</div>'
+    while (i < html.length) {
+        const nextOpen = html.indexOf('<div', i)
+        const nextClose = html.indexOf(closeTag, i)
+        if (nextClose === -1) {
+            // Malformed/unclosed; just take the rest.
+            return { content: html.slice(contentStart), end: html.length }
+        }
+        if (nextOpen !== -1 && nextOpen < nextClose) {
+            depth++
+            i = nextOpen + 4
+        } else {
+            depth--
+            if (depth === 0) {
+                return { content: html.slice(contentStart, nextClose), end: nextClose + closeTag.length }
+            }
+            i = nextClose + closeTag.length
+        }
+    }
+    return { content: html.slice(contentStart), end: html.length }
+}
+
 function parseMessageBlocks(html) {
     const blocks = []
 
@@ -31,12 +65,16 @@ function parseMessageBlocks(html) {
 
         // Text: prefer the LAST tgme_widget_message_text in the block (the
         // message's own text, not a quoted/replied-to message's text, which
-        // Telegram renders earlier in the block as a preview).
-        const textRegex = /<div class="tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)<\/div>/g
-        let textMatch
+        // Telegram renders earlier in the block as a preview). Use the
+        // depth-aware extractor so nested divs inside the message text don't
+        // truncate it.
+        const textOpenRegex = /<div class="tgme_widget_message_text[^"]*"[^>]*>/g
+        let openMatch
         let lastText = null
-        while ((textMatch = textRegex.exec(block)) !== null) {
-            lastText = textMatch[1]
+        while ((openMatch = textOpenRegex.exec(block)) !== null) {
+            const { content, end } = extractDivContent(block, openMatch.index + openMatch[0].length)
+            lastText = content
+            textOpenRegex.lastIndex = end
         }
 
         if (lastText === null) continue // media-only post with no text, skip
