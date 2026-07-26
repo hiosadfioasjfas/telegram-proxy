@@ -2,12 +2,46 @@ const express = require('express')
 const fetch = require('node-fetch')
 const app = express()
 
-function parseMessages(html) {
-    const messages = []
-    const regex = /<div class="tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)<\/div>/g
+// Extract each message BLOCK (the whole <div class="tgme_widget_message ..."> wrapper)
+// so we can pull the text and its own <time datetime="..."> from the SAME block.
+// This avoids the old bug where all message texts and all <time> tags on the
+// page were collected into two separate flat arrays and zipped by index --
+// which silently desyncs (wrong time attached to wrong message) whenever any
+// message contributes zero or more than one <time> tag (forwards, service
+// messages, grouped/album posts, reaction-only re-renders, etc.).
+function parseMessageBlocks(html) {
+    const blocks = []
+
+    // Each top-level message wrapper looks like:
+    //   <div class="tgme_widget_message ..." data-post="channel/12345" ...> ... </div>
+    // We find each wrapper's start, then find its matching close by brace-counting
+    // div depth, since these can be deeply nested (reply previews, media, etc.)
+    const wrapperRegex = /<div class="tgme_widget_message[^"]*"[^>]*data-post="[^"]*"[^>]*>/g
     let match
-    while ((match = regex.exec(html)) !== null) {
-        let text = match[1]
+    const starts = []
+    while ((match = wrapperRegex.exec(html)) !== null) {
+        starts.push(match.index)
+    }
+
+    for (let i = 0; i < starts.length; i++) {
+        const blockStart = starts[i]
+        // A block runs until the next sibling wrapper starts, or end of html.
+        const blockEnd = (i + 1 < starts.length) ? starts[i + 1] : html.length
+        const block = html.slice(blockStart, blockEnd)
+
+        // Text: prefer the LAST tgme_widget_message_text in the block (the
+        // message's own text, not a quoted/replied-to message's text, which
+        // Telegram renders earlier in the block as a preview).
+        const textRegex = /<div class="tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)<\/div>/g
+        let textMatch
+        let lastText = null
+        while ((textMatch = textRegex.exec(block)) !== null) {
+            lastText = textMatch[1]
+        }
+
+        if (lastText === null) continue // media-only post with no text, skip
+
+        let text = lastText
         text = text.replace(/<tg-emoji[^>]*>[\s\S]*?<\/tg-emoji>/g, '')
                    .replace(/<br\s*\/?>/g, '\n')
                    .replace(/<[^>]+>/g, '')
@@ -19,9 +53,27 @@ function parseMessages(html) {
                    .replace(/&#(\d+);/g, (_, c) => String.fromCharCode(parseInt(c)))
                    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
                    .replace(/\s+/g, ' ').trim()
-        if (text.length > 0) messages.push(text)
+
+        if (text.length === 0) continue
+
+        // Time: prefer the LAST <time datetime="..."> in the block. Reason:
+        // a reply/forward preview (rendered earlier in the block) carries the
+        // ORIGINAL message's time, while the message's own posting time
+        // (what we want) is the one attached to its own footer, which comes
+        // last in document order within the block.
+        const timeRegex = /<time[^>]*datetime="([^"]*)"/g
+        let timeMatch
+        let lastDatetime = null
+        while ((timeMatch = timeRegex.exec(block)) !== null) {
+            lastDatetime = timeMatch[1]
+        }
+
+        if (!lastDatetime) continue // couldn't find a timestamp for this block, skip
+
+        blocks.push({ text, datetime: lastDatetime })
     }
-    return messages
+
+    return blocks
 }
 
 // Formats a Date in Ukraine's local time (Europe/Kyiv).
@@ -138,15 +190,10 @@ app.get('/fetch', async (req, res) => {
 
         const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } })
         const html = await r.text()
-        let messages = parseMessages(html).slice(-10)
 
-        const timeRegex = /<time[^>]*datetime="([^"]*)"/g
-        const times = []
-        let tm
-        while ((tm = timeRegex.exec(html)) !== null) {
-            const date = new Date(tm[1])
-            times.push(formatKyivTime(date))
-        }
+        let blocks = parseMessageBlocks(html).slice(-10)
+        let messages = blocks.map(b => b.text)
+        const times = blocks.map(b => formatKyivTime(new Date(b.datetime)))
 
         if (lg) {
             try {
