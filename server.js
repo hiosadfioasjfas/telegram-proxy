@@ -345,6 +345,13 @@ app.get('/fetch', async (req, res) => {
         //
         // If omitted, original Telegram text is returned.
         const lg = req.query.lg // e.g. "en" -- if absent, no translation (default behavior)
+        const supportedLanguages = ['en', 'ru', 'tl', 'zh-CN']
+
+        if (lg && !supportedLanguages.includes(lg)) {
+            return res.status(400).json({
+                error: 'Unsupported language'
+            })
+        }
         // Only allow the languages we explicitly support.
         if (lg && !SUPPORTED_LANGUAGES.has(lg)) {
             return res.status(400).json({
