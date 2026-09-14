@@ -344,7 +344,7 @@ app.get('/fetch', async (req, res) => {
         // ?lg=zh-CN  -> Mandarin Chinese
         //
         // If omitted, original Telegram text is returned.
-        const lg = req.query.lg
+        const lg = req.query.lg // en, ru, tl, zh-CN
 
         // Only allow the languages we explicitly support.
         if (lg && !SUPPORTED_LANGUAGES.has(lg)) {
