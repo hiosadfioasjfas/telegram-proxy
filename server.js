@@ -203,9 +203,127 @@ function formatKyivTime(date) {
     return dd + '/' + mo + ' ' + hh + ':' + mi + ' KYIV'
 }
 
+// ------------------------------------------------------------------
+// Small in-memory translation cache.
+//
+// Keyed by "<targetLang>::<original text>". This means:
+//   - identical messages (very common with alert-bot channels) are only
+//     ever translated once per language, not on every single poll
+//   - re-fetches after a language switch don't re-translate messages
+//     that were already translated recently
+// This substantially cuts down how often we hit Google's endpoint,
+// which reduces the chance of getting rate-limited/blocked again.
+// ------------------------------------------------------------------
+const TRANSLATION_CACHE_TTL_MS = 30 * 60 * 1000 // 30 minutes
+const translationCache = new Map() // key -> { text, expiresAt }
+
+function getCached(key) {
+    const entry = translationCache.get(key)
+    if (!entry) return null
+
+    if (Date.now() > entry.expiresAt) {
+        translationCache.delete(key)
+        return null
+    }
+
+    return entry.text
+}
+
+function setCached(key, text) {
+    translationCache.set(key, {
+        text,
+        expiresAt: Date.now() + TRANSLATION_CACHE_TTL_MS
+    })
+}
+
+// Periodically sweep expired entries so the map doesn't grow forever.
+setInterval(() => {
+    const now = Date.now()
+    for (const [key, entry] of translationCache) {
+        if (now > entry.expiresAt) {
+            translationCache.delete(key)
+        }
+    }
+}, 10 * 60 * 1000)
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms))
+}
+
 // Google Translate public GTX endpoint.
+// Retries on transient failures (429 rate-limit, 5xx) with backoff, and
+// logs the actual failure reason instead of failing silently.
+async function translateChunk(chunk, targetLang, attempt = 1) {
+    const MAX_ATTEMPTS = 3
+
+    const url =
+        'https://translate.googleapis.com/translate_a/single' +
+        '?client=gtx' +
+        '&sl=auto' +
+        '&tl=' + encodeURIComponent(targetLang) +
+        '&dt=t' +
+        '&q=' + encodeURIComponent(chunk)
+
+    let r
+    try {
+        r = await fetch(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0'
+            }
+        })
+    } catch (networkErr) {
+        console.error(
+            '[translate] network error (attempt ' + attempt + '/' + MAX_ATTEMPTS + '):',
+            networkErr.message
+        )
+
+        if (attempt < MAX_ATTEMPTS) {
+            await sleep(300 * attempt)
+            return translateChunk(chunk, targetLang, attempt + 1)
+        }
+
+        throw networkErr
+    }
+
+    if (!r.ok) {
+        const bodyText = await r.text().catch(() => '<no body>')
+
+        console.error(
+            '[translate] request failed (attempt ' + attempt + '/' + MAX_ATTEMPTS + '): ' +
+            'status=' + r.status + ' target=' + targetLang + ' body=' +
+            bodyText.slice(0, 300)
+        )
+
+        // 429 = rate limited, 5xx = upstream trouble. Both are worth a
+        // short retry. Anything else (400, etc.) won't fix itself.
+        const isRetryable = r.status === 429 || r.status >= 500
+
+        if (isRetryable && attempt < MAX_ATTEMPTS) {
+            await sleep(500 * attempt)
+            return translateChunk(chunk, targetLang, attempt + 1)
+        }
+
+        throw new Error('Translate request failed: ' + r.status)
+    }
+
+    const data = await r.json()
+
+    const translated =
+        (data[0] || [])
+            .map(seg => seg[0])
+            .join('')
+
+    return translated
+}
+
 async function translateText(text, targetLang) {
     if (!text || !text.trim()) return text
+
+    const cacheKey = targetLang + '::' + text
+    const cached = getCached(cacheKey)
+    if (cached !== null) {
+        return cached
+    }
 
     const MAX_CHUNK = 1800
     const chunks = []
@@ -238,46 +356,25 @@ async function translateText(text, targetLang) {
     const translatedChunks = []
 
     for (const chunk of chunks) {
-        const url =
-            'https://translate.googleapis.com/translate_a/single' +
-            '?client=gtx' +
-            '&sl=auto' +
-            '&tl=' + encodeURIComponent(targetLang) +
-            '&dt=t' +
-            '&q=' + encodeURIComponent(chunk)
-
-        const r = await fetch(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0'
-            }
-        })
-
-        if (!r.ok) {
-            throw new Error(
-                'Translate request failed: ' + r.status
-            )
-        }
-
-        const data = await r.json()
-
-        const translated =
-            (data[0] || [])
-                .map(seg => seg[0])
-                .join('')
-
+        const translated = await translateChunk(chunk, targetLang)
         translatedChunks.push(translated)
     }
 
-    return translatedChunks.join('')
+    const result = translatedChunks.join('')
+
+    setCached(cacheKey, result)
+
+    return result
 }
 
 async function translateAll(messages, targetLang) {
-    const CONCURRENCY = 5
+    const CONCURRENCY = 3 // lowered from 5 to be gentler on the upstream endpoint
 
     const results =
         new Array(messages.length)
 
     let idx = 0
+    let failureCount = 0
 
     async function worker() {
         while (idx < messages.length) {
@@ -290,7 +387,15 @@ async function translateAll(messages, targetLang) {
                         targetLang
                     )
             } catch (e) {
-                // If translation fails, use original text.
+                // If translation fails after retries, fall back to the
+                // original text for THIS message only, but log it loudly
+                // so it's visible in Render logs instead of silently
+                // vanishing.
+                failureCount++
+                console.error(
+                    '[translate] giving up on message ' + i + ' (' + targetLang + '):',
+                    e.message
+                )
                 results[i] = messages[i]
             }
         }
@@ -307,6 +412,14 @@ async function translateAll(messages, targetLang) {
             worker
         )
     )
+
+    if (failureCount > 0) {
+        console.error(
+            '[translate] ' + failureCount + '/' + messages.length +
+            ' message(s) failed to translate into "' + targetLang +
+            '" and were served untranslated.'
+        )
+    }
 
     return results
 }
@@ -340,23 +453,11 @@ app.get('/fetch', async (req, res) => {
         //
         // If omitted, original Telegram text is returned.
         const lg = req.query.lg // e.g. "en" -- if absent, no translation (default behavior)
-        const supportedLanguages = ['en', 'ru', 'tl', 'zh-CN']
 
-        if (lg && !supportedLanguages.includes(lg)) {
-            return res.status(400).json({
-                error: 'Unsupported language'
-            })
-        }
-        // Only allow the languages we explicitly support.
         if (lg && !SUPPORTED_LANGUAGES.has(lg)) {
             return res.status(400).json({
                 error: 'Unsupported language',
-                supportedLanguages: [
-                    'en',
-                    'ru',
-                    'tl',
-                    'zh-CN'
-                ]
+                supportedLanguages: Array.from(SUPPORTED_LANGUAGES)
             })
         }
 
@@ -390,8 +491,13 @@ app.get('/fetch', async (req, res) => {
                         lg
                     )
             } catch (e) {
-                // Translation failure:
-                // silently keep original messages.
+                // This should be rare now since translateAll handles
+                // per-message failures internally, but log it just in case
+                // something else throws (e.g. a bug in translateAll itself).
+                console.error(
+                    '[translate] translateAll threw unexpectedly for "' + lg + '":',
+                    e.message
+                )
             }
         }
 
@@ -404,6 +510,7 @@ app.get('/fetch', async (req, res) => {
         res.json(result)
 
     } catch (e) {
+        console.error('[fetch] handler error:', e.message)
         res.status(500).send(
             'Error: ' + e.message
         )
