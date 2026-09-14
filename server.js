@@ -2,18 +2,29 @@ const express = require('express')
 const fetch = require('node-fetch')
 const app = express()
 
-// Supported translation languages.
-// Google Translate language codes:
-// en     = English
-// ru     = Russian
-// tl     = Filipino (Tagalog)
-// zh-CN  = Mandarin Chinese (Simplified)
+// Supported translation languages, as accepted by THIS proxy's ?lg= param
+// (kept the same as before so the Roblox side doesn't need to change).
+// zh-CN maps to LibreTranslate's "zh" code internally (see LT_LANG_MAP).
 const SUPPORTED_LANGUAGES = new Set([
     'en',
     'ru',
     'tl',
     'zh-CN'
 ])
+
+// Maps our public ?lg= values to the language codes LibreTranslate expects.
+const LT_LANG_MAP = {
+    'en': 'en',
+    'ru': 'ru',
+    'tl': 'tl',
+    'zh-CN': 'zh'
+}
+
+// Self-hosted LibreTranslate instance (Render service). Set this via the
+// LIBRETRANSLATE_URL environment variable on Render so it's not hardcoded;
+// falls back to localhost for local dev/testing.
+const LIBRETRANSLATE_URL =
+    process.env.LIBRETRANSLATE_URL || 'http://localhost:5000'
 
 // Extract each message BLOCK (the whole <div class="tgme_widget_message ..."> wrapper)
 // so we can pull the text and its own <time datetime="..."> from the SAME block.
@@ -250,26 +261,33 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-// Google Translate public GTX endpoint.
-// Retries on transient failures (429 rate-limit, 5xx) with backoff, and
-// logs the actual failure reason instead of failing silently.
+// Self-hosted LibreTranslate instance.
+// Retries on transient failures (503 = model still loading/cold start,
+// or general upstream trouble) with backoff, and logs the actual failure
+// reason instead of failing silently.
 async function translateChunk(chunk, targetLang, attempt = 1) {
     const MAX_ATTEMPTS = 3
-
-    const url =
-        'https://translate.googleapis.com/translate_a/single' +
-        '?client=gtx' +
-        '&sl=auto' +
-        '&tl=' + encodeURIComponent(targetLang) +
-        '&dt=t' +
-        '&q=' + encodeURIComponent(chunk)
+    const ltTargetLang = LT_LANG_MAP[targetLang] || targetLang
 
     let r
     try {
-        r = await fetch(url, {
+        r = await fetch(LIBRETRANSLATE_URL + '/translate', {
+            method: 'POST',
             headers: {
-                'User-Agent': 'Mozilla/5.0'
-            }
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                q: chunk,
+                source: 'auto',
+                target: ltTargetLang,
+                format: 'text'
+            }),
+            // LibreTranslate can be slow on a small/free instance,
+            // especially right after a cold start. Give it real time
+            // before giving up. AbortSignal.timeout works regardless of
+            // node-fetch major version (v2's 'timeout' option was removed
+            // in v3, so this is the portable way to do it).
+            signal: AbortSignal.timeout(20000)
         })
     } catch (networkErr) {
         console.error(
@@ -278,7 +296,7 @@ async function translateChunk(chunk, targetLang, attempt = 1) {
         )
 
         if (attempt < MAX_ATTEMPTS) {
-            await sleep(300 * attempt)
+            await sleep(500 * attempt)
             return translateChunk(chunk, targetLang, attempt + 1)
         }
 
@@ -290,16 +308,16 @@ async function translateChunk(chunk, targetLang, attempt = 1) {
 
         console.error(
             '[translate] request failed (attempt ' + attempt + '/' + MAX_ATTEMPTS + '): ' +
-            'status=' + r.status + ' target=' + targetLang + ' body=' +
+            'status=' + r.status + ' target=' + ltTargetLang + ' body=' +
             bodyText.slice(0, 300)
         )
 
-        // 429 = rate limited, 5xx = upstream trouble. Both are worth a
-        // short retry. Anything else (400, etc.) won't fix itself.
-        const isRetryable = r.status === 429 || r.status >= 500
+        // 503 commonly means LibreTranslate is still loading models
+        // (cold start) or is overloaded on a small instance. Worth a retry.
+        const isRetryable = r.status === 503 || r.status === 429 || r.status >= 500
 
         if (isRetryable && attempt < MAX_ATTEMPTS) {
-            await sleep(500 * attempt)
+            await sleep(1500 * attempt) // longer backoff: model loading can take a while
             return translateChunk(chunk, targetLang, attempt + 1)
         }
 
@@ -308,12 +326,15 @@ async function translateChunk(chunk, targetLang, attempt = 1) {
 
     const data = await r.json()
 
-    const translated =
-        (data[0] || [])
-            .map(seg => seg[0])
-            .join('')
+    if (typeof data.translatedText !== 'string') {
+        console.error(
+            '[translate] unexpected response shape:',
+            JSON.stringify(data).slice(0, 300)
+        )
+        throw new Error('Unexpected LibreTranslate response shape')
+    }
 
-    return translated
+    return data.translatedText
 }
 
 async function translateText(text, targetLang) {
@@ -521,3 +542,24 @@ app.listen(
     process.env.PORT || 3000,
     () => console.log('Proxy running')
 )
+
+// ------------------------------------------------------------------
+// Keep-alive ping for the LibreTranslate service.
+//
+// Render's free tier spins down services after ~15 min of no HTTP
+// traffic. If LibreTranslate spins down between Roblox polls, the next
+// real translation request eats a slow cold-start (and may even time
+// out/503 once, before translateChunk's retry logic kicks in and
+// succeeds on attempt 2/3). Pinging it periodically keeps it warm.
+//
+// This does NOT prevent THIS proxy itself from spinning down if Render
+// still doesn't see external traffic to it directly, but Roblox's own
+// ~10s polling already keeps this proxy warm; this ping just extends
+// that courtesy to the LibreTranslate service it depends on.
+// ------------------------------------------------------------------
+setInterval(() => {
+    fetch(LIBRETRANSLATE_URL + '/languages').catch(() => {
+        // Ignore failures here; translateChunk's own retry logic handles
+        // real translation requests failing. This is just a keep-alive.
+    })
+}, 5 * 60 * 1000) // every 5 minutes
