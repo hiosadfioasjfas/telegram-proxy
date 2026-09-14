@@ -193,11 +193,7 @@ function isUkraineDST(date) {
 
 function formatKyivTime(date) {
     const offsetHours = isUkraineDST(date) ? 3 : 2
-
-    const kyivMs =
-        date.getTime() +
-        offsetHours * 60 * 60 * 1000
-
+    const kyivMs = date.getTime() + offsetHours * 60 * 60 * 1000
     const kyiv = new Date(kyivMs)
 
     const dd = String(kyiv.getUTCDate()).padStart(2, '0')
@@ -205,7 +201,7 @@ function formatKyivTime(date) {
     const hh = String(kyiv.getUTCHours()).padStart(2, '0')
     const mi = String(kyiv.getUTCMinutes()).padStart(2, '0')
 
-    return `${dd}/${mo} ${hh}:${mi} KYIV`
+    return dd + '/' + mo + ' ' + hh + ':' + mi + ' KYIV'
 }
 
 // Google Translate public GTX endpoint.
