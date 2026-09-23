@@ -213,21 +213,30 @@ async function translateText(text, targetLang) {
 }
 
 async function translateAll(messages, targetLang) {
-    // Translate in parallel but capped, to be a good citizen of the free endpoint
-    const CONCURRENCY = 5
+    const CONCURRENCY = 1
     const results = new Array(messages.length)
     let idx = 0
+
     async function worker() {
         while (idx < messages.length) {
             const i = idx++
+
             try {
                 results[i] = await translateText(messages[i], targetLang)
             } catch (e) {
-                results[i] = messages[i] // fall back to original text on failure
+                console.error(`Translation failed for message ${i}:`, e.message)
+                results[i] = messages[i]
             }
         }
     }
-    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, messages.length) }, worker))
+
+    await Promise.all(
+        Array.from(
+            { length: Math.min(CONCURRENCY, messages.length) },
+            worker
+        )
+    )
+
     return results
 }
 
