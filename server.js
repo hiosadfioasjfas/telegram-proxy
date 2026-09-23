@@ -20,7 +20,6 @@ const app = express()
 function extractDivContent(html, contentStart) {
     let depth = 1
     let i = contentStart
-    const openRegex = /<div\b/gi
     const closeTag = '</div>'
     while (i < html.length) {
         const nextOpen = html.indexOf('<div', i)
@@ -157,19 +156,28 @@ function formatKyivTime(date) {
     return `${dd}/${mo} ${hh}:${mi} KYIV`
 }
 
-// Google Translate's public "gtx" client endpoint (same one used by browser
-// extensions / gtranslate). Free, no API key, and noticeably better quality
-// than MyMemory / LibreTranslate for this kind of text.
+// MyMemory Translation API -- free, no API key required, stable JSON
+// endpoint. Docs: https://mymemory.translated.net/doc/spec.php
+// Anonymous limit is 1000 words/day; adding an email bumps it to
+// 10,000 words/day. Set your own contact email below for the higher quota.
+//
+// We switched away from Google's unofficial translate.googleapis.com
+// "gtx" endpoint because it started silently failing (returning
+// untranslated/original text with no error) under sustained request
+// volume -- it's an unofficial scraped endpoint with no published quota,
+// so it can throttle/block an IP without any visible error response.
+const MYMEMORY_EMAIL = 'karmanadakarmana@gmail.com' // optional: set to your email for a higher daily quota
+
 async function translateText(text, targetLang) {
     if (!text || !text.trim()) return text
-    // Google's endpoint has a practical URL length limit, so split long
-    // messages into chunks on sentence/newline boundaries and translate
-    // each chunk, then rejoin. This avoids truncation on long alerts.
-    const MAX_CHUNK = 1800
+
+    // MyMemory is most reliable with shorter requests, so we chunk on
+    // sentence/newline boundaries the same way as before, just with a
+    // smaller max chunk size.
+    const MAX_CHUNK = 480
     const chunks = []
     let remaining = text
     while (remaining.length > MAX_CHUNK) {
-        // try to break on the last newline or period before the limit
         let splitAt = remaining.lastIndexOf('\n', MAX_CHUNK)
         if (splitAt < MAX_CHUNK * 0.5) splitAt = remaining.lastIndexOf('. ', MAX_CHUNK)
         if (splitAt < MAX_CHUNK * 0.5) splitAt = MAX_CHUNK
@@ -180,17 +188,28 @@ async function translateText(text, targetLang) {
 
     const translatedChunks = []
     for (const chunk of chunks) {
-        const url = 'https://translate.googleapis.com/translate_a/single'
-            + '?client=gtx&sl=auto&tl=' + encodeURIComponent(targetLang)
-            + '&dt=t&q=' + encodeURIComponent(chunk)
+        const langPair = encodeURIComponent(`uk|${targetLang}`)
+        let url = 'https://api.mymemory.translated.net/get?q=' + encodeURIComponent(chunk) + '&langpair=' + langPair
+        if (MYMEMORY_EMAIL) url += '&de=' + encodeURIComponent(MYMEMORY_EMAIL)
+
         const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } })
         if (!r.ok) throw new Error('Translate request failed: ' + r.status)
         const data = await r.json()
-        // data[0] is an array of [translatedPart, originalPart, ...] segments
-        const translated = (data[0] || []).map(seg => seg[0]).join('')
-        translatedChunks.push(translated)
+
+        if (!data || !data.responseData || typeof data.responseData.translatedText !== 'string') {
+            throw new Error('Unexpected MyMemory response shape')
+        }
+
+        // MyMemory sometimes returns a 200 OK with an error/quota message
+        // embedded in responseData instead of a real translation, so check
+        // responseStatus explicitly rather than trusting r.ok alone.
+        if (data.responseStatus && data.responseStatus !== 200) {
+            throw new Error('MyMemory error status: ' + data.responseStatus)
+        }
+
+        translatedChunks.push(data.responseData.translatedText)
     }
-    return translatedChunks.join('')
+    return translatedChunks.join(' ')
 }
 
 async function translateAll(messages, targetLang) {
